@@ -102,25 +102,36 @@ void QuadTree::insert(const Body& body) {
 }
 
 void QuadTree::updateForces(Body& body, double theta) {
+    if (body.mass == -1) {
+        // Particle is lost, skip updating forces
+        return;
+    }
+
     body.fx = 0;
     body.fy = 0;
     calculateForce(body, root, theta, body.fx, body.fy);
 }
 
+
 void QuadTree::calculateForce(const Body& body, QuadTreeNode* node, double theta, double& fx, double& fy) {
-    if (node == nullptr || node->mass == 0) return;
+    if (node == nullptr || node->mass == 0 || body.mass == -1) return;
+
+    // Check if the particle is out of bounds and mark it as lost
+    if (body.x < 0 || body.x > 4 || body.y < 0 || body.y > 4) {
+        const_cast<Body&>(body).mass = -1; // Mark the particle as lost
+        return;
+    }
 
     double dx = node->x - body.x;
     double dy = node->y - body.y;
     double distance = sqrt(dx * dx + dy * dy);
 
-    // Avoid self-interaction
+    // Avoid self-interaction and handle RLIMIT
     if (distance == 0) return;
     if (distance < RLIMIT) {
         distance = RLIMIT;
     }
 
-    // Check if the node is sufficiently far away or is a leaf node
     if (node->body != nullptr || (node->width / distance) < theta) {
         // Treat the node as a single point mass
         double F = (G * node->mass * body.mass) / (distance * distance);
@@ -134,6 +145,7 @@ void QuadTree::calculateForce(const Body& body, QuadTreeNode* node, double theta
         calculateForce(body, node->SE, theta, fx, fy);
     }
 }
+
 
 
 void parseArguments(int argc, char *argv[], std::string &inputFile, std::string &outputFile, int &steps, double &theta, double &dt, bool &visualization) {
