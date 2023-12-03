@@ -4,8 +4,10 @@
 #include <vector>
 #include <cmath>
 
-const double G = 6.67430e-11; // Gravitational constant
+const double G = 0.0001; // Gravitational constant
 const double MAX_SIZE = 4.0;
+const double DT = 0.005;
+const double RLIMIT = 0.03;
 
 struct Body {
     int index;
@@ -112,6 +114,9 @@ void QuadTree::calculateForce(const Body& body, QuadTreeNode* node, double theta
 
     // Avoid self-interaction
     if (distance == 0) return;
+    if (distance < RLIMIT) {
+        distance = RLIMIT;
+    }
 
     // Check if the node is sufficiently far away or is a leaf node
     if (node->body != nullptr || (node->width / distance) < theta) {
@@ -192,16 +197,20 @@ void simulate(std::vector<Body>& bodies, int steps, double theta, double dt) {
         for (auto& body : bodies) {
             tree.updateForces(body, theta);
 
-            // Update velocity and position
-            body.vx += body.fx / body.mass * dt;
-            body.vy += body.fy / body.mass * dt;
-            body.x += body.vx * dt;
-            body.y += body.vy * dt;
-        }
+            // Calculate acceleration
+            double ax = body.fx / body.mass;
+            double ay = body.fy / body.mass;
 
+            // Update position
+            body.x += body.vx * dt + 0.5 * ax * dt * dt;
+            body.y += body.vy * dt + 0.5 * ay * dt * dt;
+
+            // Update velocity
+            body.vx += ax * dt;
+            body.vy += ay * dt;
+        }
     }
 }
-
 void writeBodiesToFile(const std::string &fileName, const std::vector<Body> &bodies) {
     std::ofstream outFile(fileName);
     
@@ -232,6 +241,7 @@ int main(int argc, char *argv[]) {
     double theta, dt;
     bool visualization = false;
 
+    dt = DT;
     parseArguments(argc, argv, inputFile, outputFile, steps, theta, dt, visualization);
 
     std::vector<Body> bodies = readBodiesFromFile(inputFile);
