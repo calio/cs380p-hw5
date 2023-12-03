@@ -3,6 +3,8 @@
 #include <string>
 #include <vector>
 #include <cmath>
+#include <chrono>
+
 
 const double G = 0.0001; // Gravitational constant
 const double MAX_SIZE = 4.0;
@@ -178,7 +180,7 @@ std::vector<Body> readBodiesFromFile(const std::string &fileName) {
         Body body;
         file >> body.index >> body.x >> body.y >> body.mass >> body.vx >> body.vy;
         bodies.push_back(body);
-        std::cout << "Body "  << body.index << " x=" << body.x << " y=" << body.y << std::endl;
+        //std::cout << "Body "  << body.index << " x=" << body.x << " y=" << body.y << std::endl;
     }
 
     file.close();
@@ -246,7 +248,14 @@ int main(int argc, char *argv[]) {
 
     std::vector<Body> bodies = readBodiesFromFile(inputFile);
 
+    auto start = std::chrono::high_resolution_clock::now();
+
     simulate(bodies, steps, theta, dt);
+
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed = end - start;
+    std::cout << elapsed.count() << std::endl;
+
 
     writeBodiesToFile(outputFile, bodies);
 
