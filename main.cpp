@@ -3,13 +3,16 @@
 #include <iostream>
 #include <fstream>
 #include <chrono>
+#include <cmath>
+
 
 #include "BarnesHut.h" // Assume this header includes your QuadTree and Body structures
 #include <cstring>
 
-std::vector<Body> readBodiesFromFile(const std::string &fileName);
 void writeBodiesToFile(const std::string &fileName, const std::vector<Body> &bodies);
 void simulate(std::vector<Body>& bodies, int steps, double theta, double dt);
+
+
 
 void parseArguments(int argc, char *argv[], std::string &inputFile, std::string &outputFile, int &steps, double &theta, double &dt, bool &visualization) {
     if (argc < 6) {
@@ -38,6 +41,52 @@ void parseArguments(int argc, char *argv[], std::string &inputFile, std::string 
     }
 }
 
+MPI_Datatype createMPIBodyType() {
+    const int nitems = 5; // Adjust this based on the number of elements in Body
+    int blocklengths[nitems] = {1, 1, 1, 1, 1}; // All elements are of length 1
+    MPI_Datatype types[nitems] = {MPI_DOUBLE, MPI_DOUBLE, MPI_DOUBLE, MPI_DOUBLE, MPI_DOUBLE};
+    MPI_Aint offsets[nitems];
+
+    offsets[0] = offsetof(Body, x);
+    offsets[1] = offsetof(Body, y);
+    offsets[2] = offsetof(Body, mass);
+    offsets[3] = offsetof(Body, vx);
+    offsets[4] = offsetof(Body, vy);
+    // Add more offsets if you have more elements
+
+    MPI_Datatype mpi_body_type;
+    MPI_Type_create_struct(nitems, blocklengths, offsets, types, &mpi_body_type);
+    MPI_Type_commit(&mpi_body_type);
+
+    return mpi_body_type;
+}
+
+
+std::vector<Body> readBodiesFromFile(const std::string &fileName) {
+    // Read the input file and return a vector of Body structures
+    std::vector<Body> bodies;
+    std::ifstream file(fileName);
+
+    if (!file.is_open()) {
+        throw std::runtime_error("Unable to open file: " + fileName);
+    }
+
+    int numBodies;
+    file >> numBodies;
+
+    for (int i = 0; i < numBodies; ++i) {
+        Body body;
+        file >> body.index >> body.x >> body.y >> body.mass >> body.vx >> body.vy;
+        bodies.push_back(body);
+        //std::cout << "Body "  << body.index << " x=" << body.x << " y=" << body.y << std::endl;
+    }
+
+    file.close();
+    return bodies;
+}
+
+/*
+
 std::vector<Body> distributeBodies(const std::vector<Body>& all_bodies, int rank, int size) {
     int total_bodies = all_bodies.size();
     int bodies_per_process = total_bodies / size;
@@ -65,20 +114,128 @@ std::vector<Body> distributeBodies(const std::vector<Body>& all_bodies, int rank
 
     return local_bodies;
 }
+*/
+
+
+
+
+void insertBody(QuadTreeNode* node, Body* body) {
+    if (node->body == nullptr) {
+        // If the node is empty, place the body here
+        node->body = body;
+        return;
+    }
+
+    // If the node already contains a body, create children and move the existing body to one of the children
+    if (node->NW == nullptr) {
+        // Create children
+        double halfWidth = node->width / 2.0;
+        double x = node->x;
+        double y = node->y;
+        node->NW = new QuadTreeNode(x - halfWidth / 2, y + halfWidth / 2, halfWidth);
+        node->NE = new QuadTreeNode(x + halfWidth / 2, y + halfWidth / 2, halfWidth);
+        node->SW = new QuadTreeNode(x - halfWidth / 2, y - halfWidth / 2, halfWidth);
+        node->SE = new QuadTreeNode(x + halfWidth / 2, y - halfWidth / 2, halfWidth);
+        
+        // Insert the existing body into one of the new children
+        insertBody(node, node->body);
+        node->body = nullptr; // Remove body from the current node
+    }
+
+    // Determine in which child node to insert the new body
+    if (body->x < node->x) {
+        if (body->y > node->y) {
+            insertBody(node->NW, body);
+        } else {
+            insertBody(node->SW, body);
+        }
+    } else {
+        if (body->y > node->y) {
+            insertBody(node->NE, body);
+        } else {
+            insertBody(node->SE, body);
+        }
+    }
+
+    // Update the mass and center of mass for this node
+    node->mass += body->mass;
+    node->x = (node->mass * node->x + body->mass * body->x) / (node->mass + body->mass);
+    node->y = (node->mass * node->y + body->mass * body->y) / (node->mass + body->mass);
+}
+
+void QuadTree::insert(const Body& body) {
+    Body* newBody = new Body(body); // Copy the body to store in the tree
+    insertBody(root, newBody);
+}
+
+void QuadTree::updateForces(Body& body, double theta) {
+    if (body.mass == -1) {
+        // Particle is lost, skip updating forces
+        return;
+    }
+
+    body.fx = 0;
+    body.fy = 0;
+    calculateForce(body, root, theta, body.fx, body.fy);
+}
+
+void QuadTree::clear() {
+    clearNode(root);
+    root = nullptr;
+}
+
+void QuadTree::clearNode(QuadTreeNode* node) {
+    if (node != nullptr) {
+        clearNode(node->NW);
+        clearNode(node->NE);
+        clearNode(node->SW);
+        clearNode(node->SE);
+        delete node;
+    }
+}
+
+void serializeBody(const Body* body, std::vector<char>& buffer) {
+    buffer.insert(buffer.end(), reinterpret_cast<const char*>(&body->x), reinterpret_cast<const char*>(&body->x) + sizeof(body->x));
+    buffer.insert(buffer.end(), reinterpret_cast<const char*>(&body->y), reinterpret_cast<const char*>(&body->y) + sizeof(body->y));
+    buffer.insert(buffer.end(), reinterpret_cast<const char*>(&body->vx), reinterpret_cast<const char*>(&body->vx) + sizeof(body->vx));
+    buffer.insert(buffer.end(), reinterpret_cast<const char*>(&body->vy), reinterpret_cast<const char*>(&body->vy) + sizeof(body->vy));
+    buffer.insert(buffer.end(), reinterpret_cast<const char*>(&body->mass), reinterpret_cast<const char*>(&body->mass) + sizeof(body->mass));
+}
+
+Body* deserializeBody(const std::vector<char>& buffer, int& pos) {
+    Body* body = new Body();
+
+    std::memcpy(&body->x, &buffer[pos], sizeof(body->x)); pos += sizeof(body->x);
+    std::memcpy(&body->y, &buffer[pos], sizeof(body->y)); pos += sizeof(body->y);
+    std::memcpy(&body->vx, &buffer[pos], sizeof(body->vx)); pos += sizeof(body->vx);
+    std::memcpy(&body->vy, &buffer[pos], sizeof(body->vy)); pos += sizeof(body->vy);
+    std::memcpy(&body->mass, &buffer[pos], sizeof(body->mass)); pos += sizeof(body->mass);
+
+    return body;
+}
 
 
 void serializeQuadTree(QuadTreeNode* node, std::vector<char>& buffer) {
     if (node == nullptr) {
-        // Use a special marker for null pointers
-        buffer.push_back(0);
+        buffer.push_back(0); // Null marker
         return;
     }
 
-    // Serialize node data
     buffer.push_back(1); // Non-null marker
+    // Serialize node data
     buffer.insert(buffer.end(), reinterpret_cast<char*>(&node->x), reinterpret_cast<char*>(&node->x) + sizeof(node->x));
     buffer.insert(buffer.end(), reinterpret_cast<char*>(&node->y), reinterpret_cast<char*>(&node->y) + sizeof(node->y));
-    // ... Serialize other node attributes similarly ...
+    buffer.insert(buffer.end(), reinterpret_cast<char*>(&node->mass), reinterpret_cast<char*>(&node->mass) + sizeof(node->mass));
+    buffer.insert(buffer.end(), reinterpret_cast<char*>(&node->width), reinterpret_cast<char*>(&node->width) + sizeof(node->width));
+
+    // Serialize the body (if not nullptr)
+    if (node->body != nullptr) {
+        buffer.push_back(1); // Body exists marker
+        // Serialize Body object (assuming Body is serializable)
+        serializeBody(node->body, buffer); // You need to implement serializeBody
+    } else {
+        buffer.push_back(0); // No body marker
+    }
 
     // Recursively serialize children
     serializeQuadTree(node->NW, buffer);
@@ -87,24 +244,29 @@ void serializeQuadTree(QuadTreeNode* node, std::vector<char>& buffer) {
     serializeQuadTree(node->SE, buffer);
 }
 
+
 QuadTreeNode* deserializeQuadTree(const std::vector<char>& buffer, int& pos) {
-    if (pos >= buffer.size() || buffer[pos] == 0) {
+    if (pos >= (int) buffer.size() || buffer[pos] == 0) {
         pos++;
         return nullptr;
     }
 
-    pos++; // Skip the non-null marker
-
+    pos++; // Skip non-null marker
     // Deserialize node data
-    double x, y;
-    std::memcpy(&x, &buffer[pos], sizeof(x));
-    pos += sizeof(x);
-    std::memcpy(&y, &buffer[pos], sizeof(y));
-    pos += sizeof(y);
-    // ... Deserialize other node attributes similarly ...
+    double x, y, mass, width;
+    std::memcpy(&x, &buffer[pos], sizeof(x)); pos += sizeof(x);
+    std::memcpy(&y, &buffer[pos], sizeof(y)); pos += sizeof(y);
+    std::memcpy(&mass, &buffer[pos], sizeof(mass)); pos += sizeof(mass);
+    std::memcpy(&width, &buffer[pos], sizeof(width)); pos += sizeof(width);
 
     // Create a new node
-    QuadTreeNode* node = new QuadTreeNode(x, y, /* other attributes */);
+    QuadTreeNode* node = new QuadTreeNode(x, y, width);
+    node->mass = mass;
+
+    // Deserialize the body if it exists
+    if (buffer[pos++] == 1) {
+        node->body = deserializeBody(buffer, pos); // Implement deserializeBody
+    }
 
     // Recursively deserialize children
     node->NW = deserializeQuadTree(buffer, pos);
@@ -115,33 +277,39 @@ QuadTreeNode* deserializeQuadTree(const std::vector<char>& buffer, int& pos) {
     return node;
 }
 
-QuadTreeNode* deserializeQuadTree(const std::vector<char>& buffer, int& pos) {
-    if (pos >= buffer.size() || buffer[pos] == 0) {
-        pos++;
-        return nullptr;
+void QuadTree::calculateForce(const Body& body, QuadTreeNode* node, double theta, double& fx, double& fy) {
+    if (node == nullptr || node->mass == 0 || body.mass == -1) return;
+
+    // Check if the particle is out of bounds and mark it as lost
+    if (body.x < 0 || body.x > 4 || body.y < 0 || body.y > 4) {
+        const_cast<Body&>(body).mass = -1; // Mark the particle as lost
+        return;
     }
 
-    pos++; // Skip the non-null marker
+    double dx = node->x - body.x;
+    double dy = node->y - body.y;
+    double distance = sqrt(dx * dx + dy * dy);
 
-    // Deserialize node data
-    double x, y;
-    std::memcpy(&x, &buffer[pos], sizeof(x));
-    pos += sizeof(x);
-    std::memcpy(&y, &buffer[pos], sizeof(y));
-    pos += sizeof(y);
-    // ... Deserialize other node attributes similarly ...
+    // Avoid self-interaction and handle RLIMIT
+    if (distance == 0) return;
+    if (distance < RLIMIT) {
+        distance = RLIMIT;
+    }
 
-    // Create a new node
-    QuadTreeNode* node = new QuadTreeNode(x, y, /* other attributes */);
-
-    // Recursively deserialize children
-    node->NW = deserializeQuadTree(buffer, pos);
-    node->NE = deserializeQuadTree(buffer, pos);
-    node->SW = deserializeQuadTree(buffer, pos);
-    node->SE = deserializeQuadTree(buffer, pos);
-
-    return node;
+    if (node->body != nullptr || (node->width / distance) < theta) {
+        // Treat the node as a single point mass
+        double F = (G * node->mass * body.mass) / (distance * distance);
+        fx += F * dx / distance; // Force in x direction
+        fy += F * dy / distance; // Force in y direction
+    } else {
+        // Node is not far enough, need to consider its children
+        calculateForce(body, node->NW, theta, fx, fy);
+        calculateForce(body, node->NE, theta, fx, fy);
+        calculateForce(body, node->SW, theta, fx, fy);
+        calculateForce(body, node->SE, theta, fx, fy);
+    }
 }
+
 
 void updateBody(Body& body, double dt) {
     // Calculate acceleration
@@ -181,67 +349,198 @@ void gatherBodies(std::vector<Body>& all_bodies, const std::vector<Body>& local_
                 0, MPI_COMM_WORLD);
 }
 
+
+// Helper function to calculate the start and end indices for the bodies assigned to each process
+void calculateBounds(int total_bodies, int world_rank, int world_size, int &start, int &end) {
+    int chunk_size = total_bodies / world_size;
+    int remainder = total_bodies % world_size;
+
+    if (world_rank < remainder) {
+        // The first 'remainder' ranks get 'chunk_size + 1' bodies each
+        start = world_rank * (chunk_size + 1);
+        end = start + chunk_size;
+    } else {
+        // The remaining ranks get 'chunk_size' bodies each
+        start = world_rank * chunk_size + remainder;
+        end = start + (chunk_size - 1);
+    }
+}
+
+std::vector<Body> distributeBodies(const std::vector<Body> &all_bodies, int world_rank, int world_size) {
+    int total_bodies = all_bodies.size();
+    int start, end;
+
+    // Broadcast the total number of bodies to all processes
+    MPI_Bcast(&total_bodies, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    // Calculate the subset of bodies for this process
+    calculateBounds(total_bodies, world_rank, world_size, start, end);
+
+    // Create a vector to store the local bodies
+    std::vector<Body> local_bodies;
+
+    // The root process (rank 0) distributes the bodies to all processes
+    if (world_rank == 0) {
+        // For the root process, simply copy its portion
+        local_bodies.assign(all_bodies.begin() + start, all_bodies.begin() + end + 1);
+
+        // Send each other process its portion of the bodies
+        for (int rank = 1; rank < world_size; ++rank) {
+            calculateBounds(total_bodies, rank, world_size, start, end);
+            MPI_Send(&all_bodies[start], end - start + 1, MPI_BODY, rank, 0, MPI_COMM_WORLD);
+        }
+    } else {
+        // Non-root processes receive their portion of the bodies
+        local_bodies.resize(end - start + 1);
+        MPI_Recv(&local_bodies[0], end - start + 1, MPI_BODY, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    }
+
+    return local_bodies;
+}
+
+
+void simulate(std::vector<Body>& local_bodies, QuadTree& local_tree, int step, double theta, double dt) {
+    // Build the local QuadTree with the current set of bodies
+    local_tree.clear(); // Clear the existing tree
+    for (const auto& body : local_bodies) {
+        local_tree.insert(body);
+    }
+
+    // Compute the forces on each body
+    for (auto& body : local_bodies) {
+        local_tree.updateForces(body, theta);
+    }
+
+    // Update the positions and velocities of each body
+    for (auto& body : local_bodies) {
+        // Calculate acceleration
+        double ax = body.fx / body.mass;
+        double ay = body.fy / body.mass;
+
+        // Update position
+        body.x += body.vx * dt + 0.5 * ax * dt * dt;
+        body.y += body.vy * dt + 0.5 * ay * dt * dt;
+
+        // Update velocity
+        body.vx += ax * dt;
+        body.vy += ay * dt;
+    }
+}
+
+std::vector<Body> gatherAndBroadcastUpdates(const std::vector<Body>& local_bodies, int world_size) {
+    int local_count = local_bodies.size();
+    int total_count = local_count * world_size;
+
+    // Create a vector to store the updates from all processes
+    std::vector<Body> all_bodies(total_count);
+
+    // Gather updates from all processes
+    MPI_Allgather(local_bodies.data(), local_count, MPI_BODY, all_bodies.data(), local_count, MPI_BODY, MPI_COMM_WORLD);
+
+    return all_bodies;
+}
+
+
+std::vector<Body> gatherAllBodies(const std::vector<Body>& local_bodies, int world_rank, int world_size) {
+    int local_count = local_bodies.size();
+    std::vector<int> all_counts(world_size);
+    std::vector<int> displacements(world_size);
+
+    // Gather the number of bodies each process will send to the root process
+    MPI_Gather(&local_count, 1, MPI_INT, all_counts.data(), 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    // Only the root process prepares to receive all bodies
+    std::vector<Body> all_bodies;
+    if (world_rank == 0) {
+        int total_count = 0;
+        for (int i = 0; i < world_size; ++i) {
+            displacements[i] = total_count;
+            total_count += all_counts[i];
+        }
+        all_bodies.resize(total_count);
+    }
+
+    // Gather all bodies to the root process
+    MPI_Gatherv(local_bodies.data(), local_count, MPI_BODY, 
+                all_bodies.data(), all_counts.data(), displacements.data(), 
+                MPI_BODY, 0, MPI_COMM_WORLD);
+
+    return all_bodies;
+}
+
+void updateQuadTree(QuadTree& local_tree, const std::vector<Body>& all_bodies) {
+    // Clear the existing tree to prepare for new data
+    local_tree.clear();
+
+    // Insert all updated bodies into the QuadTree
+    for (const auto& body : all_bodies) {
+        local_tree.insert(body);
+    }
+}
+
+
 int main(int argc, char *argv[]) {
     // Initialize MPI
     MPI_Init(&argc, &argv);
 
-    int world_rank, world_size;
-    MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+    MPI_BODY = createMPIBodyType();
 
+
+    int world_size, world_rank;
+    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+    MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+
+    // Command line arguments
     std::string inputFile, outputFile;
     int steps;
     double theta, dt;
     bool visualization = false;
 
-    // Only rank 0 process should read the input file and distribute the bodies
+    // Parse arguments and read bodies
     std::vector<Body> bodies;
     if (world_rank == 0) {
-        // Parse arguments and read input file
         parseArguments(argc, argv, inputFile, outputFile, steps, theta, dt, visualization);
         bodies = readBodiesFromFile(inputFile);
     }
 
-    // Distribute the bodies among MPI processes
+
+    // Broadcast the number of steps, theta, and dt to all processes
+    MPI_Bcast(&steps, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&theta, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&dt, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+
+    std::cout << steps << " " << theta << " " << dt << std::endl;
+
+
+    // Distribute bodies among processes
     std::vector<Body> local_bodies = distributeBodies(bodies, world_rank, world_size);
 
-    // Begin timing the simulation
-    MPI_Barrier(MPI_COMM_WORLD);  // Synchronize before starting timing
-    double start_time = MPI_Wtime();
-
-    std::vector<Body> all_updated_bodies;
-
-    // Perform simulation steps
+    /*
+    // Main simulation loop
     for (int step = 0; step < steps; ++step) {
-        // Each process creates its local tree and computes forces
-        QuadTree local_tree(MAX_SIZE);
-        for (const auto& body : local_bodies) {
-            local_tree.insert(body);
-        }
+        // Each process updates its local bodies
+        simulate(local_bodies, 1, theta, dt);
 
-        for (auto& body : local_bodies) {
-            local_tree.updateForces(body, theta);
-            updateBody(body, dt);  // Update body position and velocity
-        }
+        // Gather and broadcast updates
+        std::vector<Body> global_updates = gatherAndBroadcastUpdates(local_bodies, world_size);
 
-        // Gather updated bodies from all processes to process 0
-        gatherBodies(all_updated_bodies, local_bodies, world_rank, world_size);
-        // Synchronize all processes here if necessary
+        // Update local Quad Tree with global updates
+        updateQuadTree(global_updates);
+
+        // Synchronize all processes
         MPI_Barrier(MPI_COMM_WORLD);
-
-        // Placeholder for MPI gathering operation
     }
 
-    // End timing the simulation
-    MPI_Barrier(MPI_COMM_WORLD);  // Synchronize before ending timing
-    double end_time = MPI_Wtime();
+    // Gather all bodies to the root process for output
+    std::vector<Body> all_bodies = gatherAllBodies(local_bodies, world_rank, world_size);
 
     if (world_rank == 0) {
-        // Process 0 writes results to file
-        writeBodiesToFile(outputFile, all_updated_bodies);
-        // Print elapsed time
-        std::cout << "Simulation time: " << (end_time - start_time) << " seconds." << std::endl;
+        writeBodiesToFile(outputFile, all_bodies);
     }
+
+    */
+    MPI_Type_free(&MPI_BODY);
+
 
     // Finalize MPI
     MPI_Finalize();

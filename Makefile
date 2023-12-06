@@ -10,13 +10,16 @@ all: $(TARGET)
 #$(TARGET): $(SRC)
 #	$(CC) $(CFLAGS) -o $(TARGET) $(SRC)
 
-nbody: bh.cpp BarnesHut.h
+nbody: main.cpp BarnesHut.h
 	$(CC) $(CFLAGS) -o nbody main.cpp
+
+run: nbody
+	mpirun -np 2 ./nbody -i input/nb-10.txt -o output.txt -s 10 -t 1 -d  0.005
 
 #bh: bh.cpp
 #	g++ $(CFLAGS) -o bh bh.cpp
 
-run: bh
+run_bh: bh
 	./bh -i input/nb-10.txt -o output.txt -s 10 -t 1 -d  0.005
 
 clean:
